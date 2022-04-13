@@ -170,7 +170,7 @@ def confirm_embed(msg: str) -> hikari.Embed:
 
 class BurgView(miru.View):
     def __init__(self, cfg: BurgConfig):
-        super().__init__()
+        super().__init__(timeout=None)
         self.cfg = cfg
 
     async def do_burg(self, ctx: miru.Context, resource: hikari.Resourceish) -> None:
