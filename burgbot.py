@@ -20,7 +20,7 @@ dotenv.load_dotenv()
 
 
 def get_dev_guilds() -> t.Sequence[int]:
-    if "DEV_GUILDS" in os.environ:
+    if "DEV_GUILDS" not in os.environ:
         logger.info("Running with global app commands.")
         return ()
     else:
