@@ -1,3 +1,5 @@
+from datetime import datetime
+from datetime import timezone
 import logging
 import os
 import pathlib
@@ -11,6 +13,7 @@ import typing as t
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 logging.getLogger("lightbulb").setLevel(logging.DEBUG)
 
 
@@ -29,15 +32,69 @@ def get_dev_guilds() -> t.Sequence[int]:
         return guilds
 
 
+class BurgStatMixin:
+    def count_burg(self: saru.GuildStateBase, count_key: str) -> None:
+        if "burger_epoch" not in self.cfg:
+            self.cfg.set("burger_epoch", datetime.utcnow().timestamp())
+
+            self.cfg.set("burgers_posted", 0)
+            self.cfg.set("angry_burgers_posted", 0)
+
+        self.cfg.get_and_set(count_key, lambda x: x + 1)
+
+    def num_burg(self: saru.GuildStateBase, count_key: str) -> int:
+        if "burger_epoch" not in self.cfg:
+            return 0
+
+        return self.cfg.get(count_key)
+
+    def average_burg_per_hour(self: saru.GuildStateBase, count_key: str) -> float:
+        if "burger_epoch" not in self.cfg:
+            return 0.0
+
+        epoch = datetime.fromtimestamp(self.cfg.get("burger_epoch"), timezone.utc)
+        now = datetime.fromtimestamp(datetime.utcnow().timestamp(), timezone.utc)
+        delta = now - epoch
+
+        # Take average over entire time burgers have been posted
+        hours = delta.total_seconds() / (60*60)
+        return round(self.cfg.get(count_key) / hours, 1)
+
+
+# Yes, I'm abusing a config system to store data, don't @ me
+@saru.config_backed("c/burg/stats")
+class GlobalBurgStats(saru.GuildStateBase, BurgStatMixin):
+    ...
+
+
+@saru.config_backed("g/burg/stats")
+class BurgStats(saru.GuildStateBase, BurgStatMixin):
+    ...
+
+
 @saru.config_backed("g/burg")
 class BurgConfig(saru.GuildStateBase):
+    def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
+        super().__init__(bot, guild)
+        self.stats: t.Optional[BurgStats] = None
+        self.gstats: t.Optional[BurgStats] = None
+
+    # bad
+    async def ainit(self):
+        s = saru.get(burgbot)
+        self.stats: BurgStats = await s.gs(BurgStats, self.guild)
+        self.gstats: GlobalBurgStats = await s.gs(GlobalBurgStats, self.guild)
+
     def is_channel_burg(self, channel: hikari.TextableGuildChannel) -> bool:
         return str(channel.id) in self.cfg.sub("channels")
 
-    async def create_burg_channel(self, ctx: lightbulb.Context, name: str) -> hikari.TextableGuildChannel:
+    def has_any_channels(self) -> bool:
+        return bool(self.cfg.get("channels"))
+
+    async def create_burg_channel(self, guild_id: int, name: str) -> hikari.TextableGuildChannel:
         burg_permissions = [
             hikari.PermissionOverwrite(
-                id=ctx.guild_id,
+                id=guild_id,
                 type=hikari.PermissionOverwriteType.ROLE,
                 deny=(
                     hikari.Permissions.SEND_MESSAGES |
@@ -46,7 +103,7 @@ class BurgConfig(saru.GuildStateBase):
                 )
             ),
             hikari.PermissionOverwrite(
-                id=ctx.bot.get_me().id,
+                id=self.bot.get_me().id,
                 type=hikari.PermissionOverwriteType.MEMBER,
                 allow=(
                     hikari.Permissions.SEND_MESSAGES
@@ -54,13 +111,13 @@ class BurgConfig(saru.GuildStateBase):
             )
         ]
 
-        channel = await ctx.bot.rest.create_guild_text_channel(
-            ctx.guild_id,
+        channel = await self.bot.rest.create_guild_text_channel(
+            guild_id,
             name,
             permission_overwrites=burg_permissions
         )
 
-        webhook = await ctx.bot.rest.create_webhook(channel, channel.name)
+        webhook = await self.bot.rest.create_webhook(channel, channel.name)
 
         cfg_obj = {
             "channel_id": channel.id,
@@ -129,7 +186,7 @@ burgbot = lightbulb.BotApp(
     help_slash_command=True,
     case_insensitive_prefix_commands=True,
     default_enabled_guilds=get_dev_guilds(),
-    intents=hikari.Intents.GUILDS
+    intents=hikari.Intents.GUILD_MESSAGES | hikari.Intents.ALL_GUILDS_UNPRIVILEGED
 )
 saru.attach(
     burgbot,
@@ -140,7 +197,10 @@ saru.attach(
         }
     }
 )
-saru.get(burgbot).gstype(BurgConfig)
+s = saru.get(burgbot)
+s.gstype(BurgConfig)
+s.gstype(BurgStats)
+s.gstype(GlobalBurgStats)
 miru.load(burgbot)
 
 
@@ -148,6 +208,7 @@ miru.load(burgbot)
 async def on_start(event: hikari.StartedEvent) -> None:
     for guild in burgbot.cache.get_guilds_view():
         cfg = t.cast(BurgConfig, await saru.get(burgbot).gs(BurgConfig, guild))
+        await cfg.ainit()
         await cfg.resume_views(event.app)
 
 
@@ -185,11 +246,13 @@ class BurgButton(miru.Button):
         self,
         cfg: BurgConfig,
         burg: hikari.Resourceish,
+        count_key: str,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.cfg = cfg
         self.burg = burg
+        self.count_key = count_key
 
     async def callback(self, ctx: miru.Context) -> None:
         self.view.stop()
@@ -201,23 +264,31 @@ class BurgButton(miru.Button):
             ctx.member.display_avatar_url,
             ctx.member.display_name
         )
+        self.cfg.gstats.count_burg(self.count_key)
+        self.cfg.stats.count_burg(self.count_key)
         await self.cfg.create_burg_button(ctx.app, ctx.message.channel_id)
 
 
 class BurgView(miru.View):
-    def __init__(self, cfg: BurgConfig, channel_id: int):
+    def __init__(
+        self,
+        cfg: BurgConfig,
+        channel_id: int
+    ):
         super().__init__(timeout=None)
         self.add_item(BurgButton(
             cfg,
             label="burg",
             style=hikari.ButtonStyle.PRIMARY,
             burg=pathlib.Path("assets/burg.jpg"),
+            count_key="burgers_posted",
             custom_id=f"burg{channel_id}"
         ))
         self.add_item(BurgButton(
             cfg,
             label="angry burg",
             style=hikari.ButtonStyle.DANGER,
+            count_key="angry_burgers_posted",
             burg=pathlib.Path("assets/angryburg.jpg"),
             custom_id=f"angryburg{channel_id}"
         ))
@@ -267,6 +338,54 @@ async def su_reload_app_cmds(ctx: lightbulb.Context) -> None:
     ))
 
 
+def populate_burg_embed(embed: hikari.Embed, cfg: BurgStatMixin, count_key: str, burgname: str) -> None:
+    embed.add_field(
+        f"{burgname}s posted all time",
+        str(cfg.num_burg(count_key)),
+    )
+    embed.add_field(
+        f"avg. {burgname}s per hour",
+        str(cfg.average_burg_per_hour(count_key))
+    )
+
+
+@burgbot.command()
+@lightbulb.option(
+    "global",
+    "Determines whether to get global stats or not.",
+    type=bool,
+    default=False
+)
+@lightbulb.command(
+    "burg-stats",
+    "Check your hot burger stats."
+)
+@lightbulb.implements(lightbulb.SlashCommand)
+async def burg_stats(ctx: lightbulb.Context) -> None:
+    embed = hikari.Embed()
+    g = ctx.raw_options["global"]
+
+    if g:
+        embed.set_author(
+            name=f"Global BurgerStats™️"
+        )
+        cfg = await GlobalBurgStats.get(ctx)
+    else:
+        embed.set_author(
+            name=f"BurgerStats™️ for {ctx.get_guild().name}",
+            icon=ctx.get_guild().icon_url
+        )
+        cfg = await BurgStats.get(ctx)
+
+    populate_burg_embed(embed, cfg, "burgers_posted", "burg")
+    populate_burg_embed(embed, cfg, "angry_burgers_posted", "angry burg")
+
+    if not g:
+        embed.set_footer("try /burg-stats global for global stats")
+
+    await ctx.respond(embed)
+
+
 @burgbot.command()
 @lightbulb.command(
     "burg-channel",
@@ -312,7 +431,7 @@ async def burg_channel_create(ctx: lightbulb.Context) -> None:
         )
         return
 
-    channel = await cfg.create_burg_channel(ctx, name)
+    channel = await cfg.create_burg_channel(ctx.guild_id, name)
     await ctx.respond(confirm_embed(
         f"New burg channel {channel.mention} created by {ctx.author.mention}."
     ))
