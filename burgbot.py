@@ -93,12 +93,16 @@ class BurgConfig(saru.GuildStateBase):
         await message.delete()
 
     async def create_burg_button(self, app: hikari.RESTAware, channel_id: int) -> None:
-        burg_buttons = BurgView(self)
         channel = t.cast(hikari.TextableGuildChannel, await app.rest.fetch_channel(channel_id))
+        burg_buttons = BurgView(self, channel_id)
         message = await channel.send(components=burg_buttons.build())
         self.cfg.path_set(f"channels/{channel.id}/button_id", message.id)
-
         burg_buttons.start(message)
+
+    async def resume_views(self, app: hikari.RESTAware) -> None:
+        for burg_cfg in self.cfg.get("channels").values():
+            message = await app.rest.fetch_message(burg_cfg["channel_id"], burg_cfg["button_id"])
+            BurgView(self, message.channel_id).start(message)
 
     async def post_to_burghook(
         self,
@@ -140,6 +144,13 @@ saru.get(burgbot).gstype(BurgConfig)
 miru.load(burgbot)
 
 
+@burgbot.listen(hikari.StartedEvent)
+async def on_start(event: hikari.StartedEvent) -> None:
+    for guild in burgbot.cache.get_guilds_view():
+        cfg = t.cast(BurgConfig, await saru.get(burgbot).gs(BurgConfig, guild))
+        await cfg.resume_views(event.app)
+
+
 def get_channel_by_name(ctx: lightbulb.Context, name: str) -> t.Optional[hikari.TextableGuildChannel]:
     for channel in ctx.get_guild().get_channels().values():
         if channel.name == name and channel.type == hikari.ChannelType.GUILD_TEXT:
@@ -168,30 +179,48 @@ def confirm_embed(msg: str) -> hikari.Embed:
     return embed
 
 
-class BurgView(miru.View):
-    def __init__(self, cfg: BurgConfig):
-        super().__init__(timeout=None)
+class BurgButton(miru.Button):
+    """Press button, get burg."""
+    def __init__(
+        self,
+        cfg: BurgConfig,
+        burg: hikari.Resourceish,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
         self.cfg = cfg
+        self.burg = burg
 
-    async def do_burg(self, ctx: miru.Context, resource: hikari.Resourceish) -> None:
-        self.stop()
+    async def callback(self, ctx: miru.Context) -> None:
+        self.view.stop()
         await self.cfg.remove_burg_button(ctx.message)
         await self.cfg.post_to_burghook(
             ctx.app,
             ctx.channel_id,
-            resource,
+            self.burg,
             ctx.member.display_avatar_url,
             ctx.member.display_name
         )
         await self.cfg.create_burg_button(ctx.app, ctx.message.channel_id)
 
-    @miru.button(label="burg", style=hikari.ButtonStyle.PRIMARY)
-    async def burg_button(self, button: miru.Button, ctx: miru.Context) -> None:
-        await self.do_burg(ctx, pathlib.Path("assets/burg.jpg"))
 
-    @miru.button(label="angry burg", style=hikari.ButtonStyle.DANGER)
-    async def angry_burg_button(self, button: miru.Button, ctx: miru.Context) -> None:
-        await self.do_burg(ctx, pathlib.Path("assets/angryburg.jpg"))
+class BurgView(miru.View):
+    def __init__(self, cfg: BurgConfig, channel_id: int):
+        super().__init__(timeout=None)
+        self.add_item(BurgButton(
+            cfg,
+            label="burg",
+            style=hikari.ButtonStyle.PRIMARY,
+            burg=pathlib.Path("assets/burg.jpg"),
+            custom_id=f"burg{channel_id}"
+        ))
+        self.add_item(BurgButton(
+            cfg,
+            label="angry burg",
+            style=hikari.ButtonStyle.DANGER,
+            burg=pathlib.Path("assets/angryburg.jpg"),
+            custom_id=f"angryburg{channel_id}"
+        ))
 
 
 @burgbot.command()
