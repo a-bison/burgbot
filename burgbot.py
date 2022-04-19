@@ -158,7 +158,13 @@ class BurgConfig(saru.GuildStateBase):
 
     async def resume_views(self, app: hikari.RESTAware) -> None:
         for burg_cfg in self.cfg.get("channels").values():
-            message = await app.rest.fetch_message(burg_cfg["channel_id"], burg_cfg["button_id"])
+            try:
+                message = await app.rest.fetch_message(burg_cfg["channel_id"], burg_cfg["button_id"])
+            except hikari.NotFoundError:
+                # Burg buttons may have been deleted while the bot was offline. Recreate if so.
+                await self.create_burg_button(app, burg_cfg["channel_id"])
+                return
+
             BurgView(self, message.channel_id).start(message)
 
     async def post_to_burghook(
