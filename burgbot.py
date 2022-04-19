@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from datetime import timezone
 import logging
@@ -260,9 +261,7 @@ class BurgButton(miru.Button):
         self.burg = burg
         self.count_key = count_key
 
-    async def callback(self, ctx: miru.Context) -> None:
-        self.view.stop()
-        await self.cfg.remove_burg_button(ctx.message)
+    async def _post_burg_unsafe(self, ctx: miru.Context):
         await self.cfg.post_to_burghook(
             ctx.app,
             ctx.channel_id,
@@ -270,8 +269,39 @@ class BurgButton(miru.Button):
             ctx.member.display_avatar_url,
             ctx.member.display_name
         )
-        self.cfg.gstats.count_burg(self.count_key)
-        self.cfg.stats.count_burg(self.count_key)
+
+    async def post_burg(self, ctx: miru.Context):
+        try:
+            await self._post_burg_unsafe(ctx)
+        except hikari.RateLimitedError as e:
+            backoff = e.retry_after + 1
+            logger.warning(f"Got ratelimited posting to {e.route}. Retrying after {backoff}s...")
+            await ctx.respond(
+                error_embed(
+                    f"Slow down! Burgposting has hit discord ratelimit. Trying again in {backoff} seconds."
+                ),
+                flags=hikari.MessageFlag.EPHEMERAL
+            )
+            await asyncio.sleep(backoff)
+            await self._post_burg_unsafe(ctx) # If it errors again here just give up
+
+    async def callback(self, ctx: miru.Context) -> None:
+        self.view.stop()
+        await self.cfg.remove_burg_button(ctx.message)
+
+        try:
+            await self.post_burg(ctx)
+            self.cfg.gstats.count_burg(self.count_key)
+            self.cfg.stats.count_burg(self.count_key)
+        except Exception: # noqa
+            await ctx.respond(
+                error_embed(
+                    f"Unexpected issue while sending burg. Try again in a bit."
+                ),
+                flags=hikari.MessageFlag.EPHEMERAL
+            )
+        
+        # Always recreate the burg button, even if we fail to post burg.
         await self.cfg.create_burg_button(ctx.app, ctx.message.channel_id)
 
 
